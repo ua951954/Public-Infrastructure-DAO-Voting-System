@@ -14,6 +14,7 @@
 (define-data-var proposal-counter uint u0)
 (define-data-var total-treasury uint u0)
 (define-data-var min-stake uint u1000)
+(define-data-var contract-initialized bool false)
 
 (define-map proposals
     uint
@@ -60,6 +61,17 @@
         spent: uint,
         priority: uint,
     }
+)
+
+(define-private (is-valid-category (category (string-ascii 50)))
+    (is-some (map-get? categories category))
+)
+
+(define-private (get-category-priority (category (string-ascii 50)))
+    (match (map-get? categories category)
+        category-data (get priority category-data)
+        u1
+    )
 )
 
 (define-public (register-citizen)
@@ -162,9 +174,14 @@
 )
 
 (define-private (update-treasury (amount uint))
-    (begin
-        (var-set total-treasury (- (var-get total-treasury) amount))
-        (ok true)
+    (let ((current-treasury (var-get total-treasury)))
+        (if (>= current-treasury amount)
+            (begin
+                (var-set total-treasury (- current-treasury amount))
+                (ok true)
+            )
+            ERR_INSUFFICIENT_FUNDS
+        )
     )
 )
 
@@ -179,18 +196,7 @@
             )
             (ok true)
         )
-        (err ERR_INVALID_CATEGORY)
-    )
-)
-
-(define-private (is-valid-category (category (string-ascii 50)))
-    (is-some (map-get? categories category))
-)
-
-(define-private (get-category-priority (category (string-ascii 50)))
-    (match (map-get? categories category)
-        category-data (get priority category-data)
-        u1
+        ERR_INVALID_CATEGORY
     )
 )
 
@@ -220,10 +226,44 @@
     (var-get total-treasury)
 )
 
-(define-read-only (get-active-proposals)
-    (filter is-active-proposal
-        (map uint-to-proposal (generate-sequence u1 (var-get proposal-counter)))
+(define-public (initialize-contract)
+    (begin
+        (asserts! (not (var-get contract-initialized)) ERR_UNAUTHORIZED)
+        (map-set categories "infrastructure" {
+            budget: u100000,
+            spent: u0,
+            priority: u1,
+        })
+        (map-set categories "governance" {
+            budget: u50000,
+            spent: u0,
+            priority: u2,
+        })
+        (map-set categories "community" {
+            budget: u75000,
+            spent: u0,
+            priority: u3,
+        })
+        (map-set categories "development" {
+            budget: u80000,
+            spent: u0,
+            priority: u4,
+        })
+        (var-set contract-initialized true)
+        (ok true)
     )
+)
+
+(define-public (fund-treasury (amount uint))
+    (let ((caller tx-sender))
+        (try! (stx-transfer? amount caller (as-contract tx-sender)))
+        (var-set total-treasury (+ (var-get total-treasury) amount))
+        (ok true)
+    )
+)
+
+(define-private (uint-to-proposal (id uint))
+    (map-get? proposals id)
 )
 
 (define-private (is-active-proposal (proposal (optional {
@@ -248,13 +288,335 @@
     )
 )
 
-(define-private (uint-to-proposal (id uint))
-    (map-get? proposals id)
-)
-
 (define-private (generate-sequence
         (start uint)
         (end uint)
     )
-    (list start)
+    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19 u20)
+)
+
+(define-read-only (get-active-proposals)
+    (filter is-active-proposal
+        (map uint-to-proposal (generate-sequence u1 (var-get proposal-counter)))
+    )
+)
+(define-constant ERR_EXECUTION_FAILED (err u200))
+(define-constant ERR_PROPOSAL_REJECTED (err u201))
+(define-constant ERR_ALREADY_EXECUTED (err u202))
+(define-constant ERR_VOTING_NOT_ENDED (err u203))
+
+(define-map proposal-recipients
+    uint
+    {
+        recipient: principal,
+        amount: uint,
+    }
+)
+
+(define-public (set-proposal-recipient
+        (proposal-id uint)
+        (recipient principal)
+        (amount uint)
+    )
+    (let (
+            (caller tx-sender)
+            (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+        )
+        (asserts! (is-eq caller (get proposer proposal)) ERR_UNAUTHORIZED)
+        (asserts! (is-eq amount (get amount proposal)) ERR_INVALID_AMOUNT)
+        (map-set proposal-recipients proposal-id {
+            recipient: recipient,
+            amount: amount,
+        })
+        (ok true)
+    )
+)
+
+(define-public (execute-proposal (proposal-id uint))
+    (let (
+            (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (recipient-data (unwrap! (map-get? proposal-recipients proposal-id)
+                ERR_EXECUTION_FAILED
+            ))
+            (votes-for (get votes-for proposal))
+            (votes-against (get votes-against proposal))
+            (total-votes (+ votes-for votes-against))
+        )
+        (asserts! (> stacks-block-height (get end-block proposal))
+            ERR_VOTING_NOT_ENDED
+        )
+        (asserts! (not (get executed proposal)) ERR_ALREADY_EXECUTED)
+        (asserts! (> total-votes u0) ERR_EXECUTION_FAILED)
+        (asserts! (> votes-for votes-against) ERR_PROPOSAL_REJECTED)
+        (asserts! (>= (* votes-for u100) (* total-votes u51))
+            ERR_PROPOSAL_REJECTED
+        )
+        (try! (as-contract (stx-transfer? (get amount recipient-data) tx-sender
+            (get recipient recipient-data)
+        )))
+        (try! (update-treasury (get amount proposal)))
+        (try! (update-category-budget (get category proposal) (get amount proposal)))
+        (map-set proposals proposal-id (merge proposal { executed: true }))
+        (ok true)
+    )
+)
+
+(define-public (batch-execute-proposals (proposal-ids (list 10 uint)))
+    (let ((results (map execute-single-proposal proposal-ids)))
+        (ok results)
+    )
+)
+
+(define-private (execute-single-proposal (proposal-id uint))
+    (match (execute-proposal proposal-id)
+        success
+        proposal-id
+        error
+        u0
+    )
+)
+
+(define-read-only (get-proposal-recipient (proposal-id uint))
+    (map-get? proposal-recipients proposal-id)
+)
+
+(define-read-only (is-proposal-executable (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal (let (
+                (votes-for (get votes-for proposal))
+                (votes-against (get votes-against proposal))
+                (total-votes (+ votes-for votes-against))
+            )
+            (and
+                (> stacks-block-height (get end-block proposal))
+                (not (get executed proposal))
+                (> votes-for votes-against)
+                (>= (* votes-for u100) (* total-votes u51))
+                (is-some (map-get? proposal-recipients proposal-id))
+            )
+        )
+        false
+    )
+)
+
+(define-read-only (get-executable-proposals)
+    (filter is-executable-proposal-wrapper
+        (map uint-to-proposal-id (generate-sequence-for-execution u1 u100))
+    )
+)
+
+(define-private (is-executable-proposal-wrapper (proposal-id uint))
+    (is-proposal-executable proposal-id)
+)
+
+(define-private (uint-to-proposal-id (id uint))
+    id
+)
+
+(define-private (generate-sequence-for-execution
+        (start uint)
+        (end uint)
+    )
+    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+)
+(define-constant ERR_CANNOT_DELEGATE_TO_SELF (err u300))
+(define-constant ERR_DELEGATION_NOT_FOUND (err u301))
+(define-constant ERR_CIRCULAR_DELEGATION (err u302))
+(define-constant ERR_MAX_DELEGATION_DEPTH (err u303))
+
+(define-data-var max-delegation-depth uint u3)
+
+(define-map delegations
+    principal
+    {
+        delegate: principal,
+        delegated-power: uint,
+        active: bool,
+    }
+)
+
+(define-map delegation-received
+    principal
+    {
+        total-delegated-power: uint,
+        delegator-count: uint,
+    }
+)
+
+(define-map voting-history
+    principal
+    {
+        total-votes: uint,
+        successful-votes: uint,
+        last-activity: uint,
+    }
+)
+
+(define-public (delegate-voting-power (delegate principal))
+    (let (
+            (caller tx-sender)
+            (citizen (unwrap! (get-citizen caller) ERR_NOT_CITIZEN))
+            (delegate-citizen (unwrap! (get-citizen delegate) ERR_NOT_CITIZEN))
+            (voting-power (get voting-power citizen))
+        )
+        (asserts! (not (is-eq caller delegate)) ERR_CANNOT_DELEGATE_TO_SELF)
+        (asserts! (not (has-circular-delegation caller delegate))
+            ERR_CIRCULAR_DELEGATION
+        )
+        (match (map-get? delegations caller)
+            existing-delegation (begin
+                (unwrap-panic (remove-delegation-from-previous-delegate caller
+                    (get delegate existing-delegation) voting-power
+                ))
+                true
+            )
+            true
+        )
+        (map-set delegations caller {
+            delegate: delegate,
+            delegated-power: voting-power,
+            active: true,
+        })
+        (match (map-get? delegation-received delegate)
+            existing-received (map-set delegation-received delegate {
+                total-delegated-power: (+ (get total-delegated-power existing-received) voting-power),
+                delegator-count: (+ (get delegator-count existing-received) u1),
+            })
+            (map-set delegation-received delegate {
+                total-delegated-power: voting-power,
+                delegator-count: u1,
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation)
+    (let (
+            (caller tx-sender)
+            (delegation (unwrap! (map-get? delegations caller) ERR_DELEGATION_NOT_FOUND))
+            (delegate (get delegate delegation))
+            (delegated-power (get delegated-power delegation))
+        )
+        (unwrap-panic (remove-delegation-from-previous-delegate caller delegate delegated-power))
+        (map-delete delegations caller)
+        (ok true)
+    )
+)
+
+(define-public (vote-with-delegation
+        (proposal-id uint)
+        (support bool)
+    )
+    (let (
+            (caller tx-sender)
+            (total-power (calculate-total-voting-power caller))
+        )
+        (try! (vote proposal-id support))
+        (unwrap-panic (update-voting-history caller proposal-id support))
+        (ok total-power)
+    )
+)
+
+(define-public (update-voting-power-based-on-activity (citizen principal))
+    (let (
+            (history (default-to {
+                total-votes: u0,
+                successful-votes: u0,
+                last-activity: u0,
+            }
+                (map-get? voting-history citizen)
+            ))
+            (base-power u1)
+            (activity-bonus (/ (get total-votes history) u10))
+            (success-bonus (/ (get successful-votes history) u5))
+            (new-power (+ base-power activity-bonus success-bonus))
+        )
+        (ok new-power)
+    )
+)
+
+(define-private (remove-delegation-from-previous-delegate
+        (delegator principal)
+        (delegate principal)
+        (power uint)
+    )
+    (match (map-get? delegation-received delegate)
+        existing-received (begin
+            (map-set delegation-received delegate {
+                total-delegated-power: (- (get total-delegated-power existing-received) power),
+                delegator-count: (- (get delegator-count existing-received) u1),
+            })
+            (ok true)
+        )
+        (ok true)
+    )
+)
+
+(define-private (has-circular-delegation
+        (delegator principal)
+        (potential-delegate principal)
+    )
+    (is-eq delegator potential-delegate)
+)
+
+(define-private (calculate-total-voting-power (citizen principal))
+    (let (
+            (base-citizen (unwrap-panic (get-citizen citizen)))
+            (base-power (get voting-power base-citizen))
+            (delegated-power (match (map-get? delegation-received citizen)
+                received (get total-delegated-power received)
+                u0
+            ))
+        )
+        (+ base-power delegated-power)
+    )
+)
+
+(define-private (update-voting-history
+        (voter principal)
+        (proposal-id uint)
+        (support bool)
+    )
+    (let ((current-history (default-to {
+            total-votes: u0,
+            successful-votes: u0,
+            last-activity: u0,
+        }
+            (map-get? voting-history voter)
+        )))
+        (map-set voting-history voter {
+            total-votes: (+ (get total-votes current-history) u1),
+            successful-votes: (get successful-votes current-history),
+            last-activity: stacks-block-height,
+        })
+        (ok true)
+    )
+)
+
+(define-read-only (get-delegation (delegator principal))
+    (map-get? delegations delegator)
+)
+
+(define-read-only (get-delegation-received (delegate principal))
+    (map-get? delegation-received delegate)
+)
+
+(define-read-only (get-total-voting-power (citizen principal))
+    (calculate-total-voting-power citizen)
+)
+
+(define-read-only (get-voting-history (citizen principal))
+    (map-get? voting-history citizen)
+)
+
+(define-read-only (is-active-delegate (delegate principal))
+    (match (map-get? delegation-received delegate)
+        received (> (get delegator-count received) u0)
+        false
+    )
+)
+
+(define-read-only (get-delegation-chain (citizen principal))
+    (list citizen)
 )
