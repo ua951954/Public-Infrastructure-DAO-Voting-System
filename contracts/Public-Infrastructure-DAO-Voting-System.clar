@@ -620,3 +620,174 @@
 (define-read-only (get-delegation-chain (citizen principal))
     (list citizen)
 )
+
+(define-constant ERR_SCHEDULE_TOO_EARLY (err u400))
+(define-constant ERR_TIMELOCK_NOT_EXPIRED (err u401))
+(define-constant ERR_SCHEDULE_NOT_FOUND (err u402))
+(define-constant ERR_ALREADY_SCHEDULED (err u403))
+
+(define-data-var timelock-delay uint u144)
+
+(define-map proposal-schedules
+    uint
+    {
+        scheduled-at: uint,
+        execution-block: uint,
+        scheduled-by: principal,
+        cancelled: bool,
+    }
+)
+
+(define-map execution-queue
+    uint
+    {
+        proposal-id: uint,
+        execution-block: uint,
+        priority: uint,
+    }
+)
+
+(define-data-var queue-counter uint u0)
+
+(define-public (schedule-proposal-execution
+        (proposal-id uint)
+        (execution-delay uint)
+    )
+    (let (
+            (caller tx-sender)
+            (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (min-delay (var-get timelock-delay))
+            (execution-block (+ stacks-block-height execution-delay))
+        )
+        (asserts! (is-proposal-executable proposal-id) ERR_EXECUTION_FAILED)
+        (asserts! (>= execution-delay min-delay) ERR_SCHEDULE_TOO_EARLY)
+        (asserts! (is-none (map-get? proposal-schedules proposal-id))
+            ERR_ALREADY_SCHEDULED
+        )
+        (map-set proposal-schedules proposal-id {
+            scheduled-at: stacks-block-height,
+            execution-block: execution-block,
+            scheduled-by: caller,
+            cancelled: false,
+        })
+        (let ((queue-id (+ (var-get queue-counter) u1)))
+            (map-set execution-queue queue-id {
+                proposal-id: proposal-id,
+                execution-block: execution-block,
+                priority: (get priority proposal),
+            })
+            (var-set queue-counter queue-id)
+            (ok queue-id)
+        )
+    )
+)
+
+(define-public (execute-scheduled-proposal (proposal-id uint))
+    (let (
+            (schedule (unwrap! (map-get? proposal-schedules proposal-id)
+                ERR_SCHEDULE_NOT_FOUND
+            ))
+            (execution-block (get execution-block schedule))
+        )
+        (asserts! (>= stacks-block-height execution-block)
+            ERR_TIMELOCK_NOT_EXPIRED
+        )
+        (asserts! (not (get cancelled schedule)) ERR_EXECUTION_FAILED)
+        (try! (execute-proposal proposal-id))
+        (map-delete proposal-schedules proposal-id)
+        (ok true)
+    )
+)
+
+(define-public (cancel-scheduled-proposal (proposal-id uint))
+    (let (
+            (caller tx-sender)
+            (schedule (unwrap! (map-get? proposal-schedules proposal-id)
+                ERR_SCHEDULE_NOT_FOUND
+            ))
+        )
+        (asserts!
+            (or
+                (is-eq caller (get scheduled-by schedule))
+                (is-eq caller CONTRACT_OWNER)
+            )
+            ERR_UNAUTHORIZED
+        )
+        (map-set proposal-schedules proposal-id
+            (merge schedule { cancelled: true })
+        )
+        (ok true)
+    )
+)
+
+(define-public (batch-execute-scheduled-proposals (proposal-ids (list 5 uint)))
+    (let ((results (map execute-scheduled-single proposal-ids)))
+        (ok results)
+    )
+)
+
+(define-private (execute-scheduled-single (proposal-id uint))
+    (match (execute-scheduled-proposal proposal-id)
+        success
+        proposal-id
+        error
+        u0
+    )
+)
+
+(define-public (update-timelock-delay (new-delay uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (var-set timelock-delay new-delay)
+        (ok true)
+    )
+)
+
+(define-read-only (get-proposal-schedule (proposal-id uint))
+    (map-get? proposal-schedules proposal-id)
+)
+
+(define-read-only (get-queue-item (queue-id uint))
+    (map-get? execution-queue queue-id)
+)
+
+(define-read-only (get-timelock-delay)
+    (var-get timelock-delay)
+)
+
+(define-read-only (is-proposal-scheduled (proposal-id uint))
+    (match (map-get? proposal-schedules proposal-id)
+        schedule (not (get cancelled schedule))
+        false
+    )
+)
+
+(define-read-only (get-ready-for-execution)
+    (filter is-ready-for-execution-wrapper
+        (map get-queue-proposal-id (generate-execution-sequence u1 u20))
+    )
+)
+
+(define-private (is-ready-for-execution-wrapper (proposal-id uint))
+    (match (map-get? proposal-schedules proposal-id)
+        schedule (and
+            (>= stacks-block-height (get execution-block schedule))
+            (not (get cancelled schedule))
+        )
+        false
+    )
+)
+
+(define-private (get-queue-proposal-id (queue-id uint))
+    (match (map-get? execution-queue queue-id)
+        queue-item (get proposal-id queue-item)
+        u0
+    )
+)
+
+(define-private (generate-execution-sequence
+        (start uint)
+        (end uint)
+    )
+    (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
+)
