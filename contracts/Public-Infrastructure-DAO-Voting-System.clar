@@ -791,3 +791,186 @@
     )
     (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10)
 )
+
+(define-constant ERR_INSUFFICIENT_QUORUM (err u500))
+(define-constant ERR_INVALID_WINDOW (err u501))
+
+(define-data-var base-quorum-percentage uint u20)
+(define-data-var max-quorum-percentage uint u60)
+(define-data-var min-quorum-percentage uint u10)
+(define-data-var quorum-adjustment-window uint u10)
+
+(define-map participation-history
+    uint
+    {
+        total-eligible-voters: uint,
+        total-participants: uint,
+        participation-rate: uint,
+        block-height: uint,
+    }
+)
+
+(define-map quorum-snapshots
+    uint
+    {
+        required-quorum: uint,
+        calculated-at: uint,
+        base-rate: uint,
+        adjustment-factor: uint,
+    }
+)
+
+(define-data-var participation-counter uint u0)
+(define-data-var total-registered-citizens uint u0)
+
+(define-public (record-participation-snapshot
+        (total-participants uint)
+        (participation-rate uint)
+    )
+    (let (
+            (snapshot-id (+ (var-get participation-counter) u1))
+            (total-citizens (var-get total-registered-citizens))
+        )
+        (map-set participation-history snapshot-id {
+            total-eligible-voters: total-citizens,
+            total-participants: total-participants,
+            participation-rate: participation-rate,
+            block-height: stacks-block-height,
+        })
+        (var-set participation-counter snapshot-id)
+        (ok snapshot-id)
+    )
+)
+
+(define-public (calculate-dynamic-quorum
+        (proposal-id uint)
+        (recent-participation-rate uint)
+    )
+    (let (
+            (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (base-quorum (var-get base-quorum-percentage))
+            (adjustment-factor (calculate-quorum-adjustment recent-participation-rate))
+            (adjusted-quorum (+ base-quorum adjustment-factor))
+            (dynamic-quorum (if (<= adjusted-quorum (var-get min-quorum-percentage))
+                (var-get min-quorum-percentage)
+                (if (>= adjusted-quorum (var-get max-quorum-percentage))
+                    (var-get max-quorum-percentage)
+                    adjusted-quorum
+                )
+            ))
+        )
+        (map-set quorum-snapshots proposal-id {
+            required-quorum: dynamic-quorum,
+            calculated-at: stacks-block-height,
+            base-rate: base-quorum,
+            adjustment-factor: adjustment-factor,
+        })
+        (ok dynamic-quorum)
+    )
+)
+
+(define-public (validate-proposal-quorum (proposal-id uint))
+    (let (
+            (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (quorum-data (unwrap! (map-get? quorum-snapshots proposal-id)
+                ERR_INSUFFICIENT_QUORUM
+            ))
+            (required-quorum (get required-quorum quorum-data))
+            (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
+            (total-citizens (var-get total-registered-citizens))
+            (participation-percentage (if (> total-citizens u0)
+                (/ (* total-votes u100) total-citizens)
+                u0
+            ))
+        )
+        (asserts! (>= participation-percentage required-quorum)
+            ERR_INSUFFICIENT_QUORUM
+        )
+        (ok true)
+    )
+)
+
+(define-public (update-citizen-count)
+    (let ((current-count (var-get total-registered-citizens)))
+        (var-set total-registered-citizens (+ current-count u1))
+        (ok (+ current-count u1))
+    )
+)
+
+(define-public (configure-quorum-parameters
+        (base-percentage uint)
+        (max-percentage uint)
+        (min-percentage uint)
+        (window-size uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (<= min-percentage base-percentage) ERR_INVALID_AMOUNT)
+        (asserts! (<= base-percentage max-percentage) ERR_INVALID_AMOUNT)
+        (asserts! (and (>= window-size u5) (<= window-size u50))
+            ERR_INVALID_WINDOW
+        )
+        (var-set base-quorum-percentage base-percentage)
+        (var-set max-quorum-percentage max-percentage)
+        (var-set min-quorum-percentage min-percentage)
+        (var-set quorum-adjustment-window window-size)
+        (ok true)
+    )
+)
+
+(define-private (calculate-quorum-adjustment (avg-participation uint))
+    (let ((base-participation u30))
+        (if (> avg-participation base-participation)
+            (/ (- avg-participation base-participation) u4)
+            (- u0 (/ (- base-participation avg-participation) u6))
+        )
+    )
+)
+
+(define-read-only (get-current-quorum-requirement (proposal-id uint))
+    (map-get? quorum-snapshots proposal-id)
+)
+
+(define-read-only (get-participation-snapshot (snapshot-id uint))
+    (map-get? participation-history snapshot-id)
+)
+
+(define-read-only (get-quorum-parameters)
+    {
+        base-percentage: (var-get base-quorum-percentage),
+        max-percentage: (var-get max-quorum-percentage),
+        min-percentage: (var-get min-quorum-percentage),
+        adjustment-window: (var-get quorum-adjustment-window),
+    }
+)
+
+(define-read-only (get-total-registered-citizens)
+    (var-get total-registered-citizens)
+)
+
+(define-read-only (calculate-proposal-participation (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal (let (
+                (total-votes (+ (get votes-for proposal) (get votes-against proposal)))
+                (total-citizens (var-get total-registered-citizens))
+            )
+            (if (> total-citizens u0)
+                (/ (* total-votes u100) total-citizens)
+                u0
+            )
+        )
+        u0
+    )
+)
+
+(define-read-only (is-quorum-met (proposal-id uint))
+    (match (map-get? quorum-snapshots proposal-id)
+        quorum-data (let (
+                (required (get required-quorum quorum-data))
+                (actual (calculate-proposal-participation proposal-id))
+            )
+            (>= actual required)
+        )
+        false
+    )
+)
