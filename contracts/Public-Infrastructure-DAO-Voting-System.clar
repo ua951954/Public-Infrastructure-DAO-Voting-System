@@ -974,3 +974,225 @@
         false
     )
 )
+
+(define-constant ERR_AMENDMENT_LIMIT_REACHED (err u600))
+(define-constant ERR_AMENDMENT_WINDOW_CLOSED (err u601))
+(define-constant ERR_VOTES_ALREADY_CAST (err u602))
+
+(define-data-var max-amendments-per-proposal uint u3)
+(define-data-var amendment-window-percentage uint u50)
+
+(define-map proposal-amendments
+    {
+        proposal-id: uint,
+        amendment-id: uint,
+    }
+    {
+        amended-description: (string-ascii 500),
+        amended-amount: uint,
+        amended-at: uint,
+        amended-by: principal,
+        reason: (string-ascii 200),
+    }
+)
+
+(define-map amendment-counters
+    uint
+    {
+        total-amendments: uint,
+        last-amendment-block: uint,
+    }
+)
+
+(define-map voter-amendment-tracking
+    {
+        proposal-id: uint,
+        voter: principal,
+    }
+    {
+        voted-before-amendment: uint,
+        notified: bool,
+    }
+)
+
+(define-public (amend-proposal
+        (proposal-id uint)
+        (new-description (string-ascii 500))
+        (new-amount uint)
+        (reason (string-ascii 200))
+    )
+    (let (
+            (caller tx-sender)
+            (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (amendment-data (default-to {
+                total-amendments: u0,
+                last-amendment-block: u0,
+            }
+                (map-get? amendment-counters proposal-id)
+            ))
+            (amendment-count (get total-amendments amendment-data))
+            (voting-period (- (get end-block proposal) (get start-block proposal)))
+            (amendment-window (/ (* voting-period (var-get amendment-window-percentage)) u100))
+            (amendment-deadline (+ (get start-block proposal) amendment-window))
+        )
+        (asserts! (is-eq caller (get proposer proposal)) ERR_UNAUTHORIZED)
+        (asserts! (<= stacks-block-height amendment-deadline)
+            ERR_AMENDMENT_WINDOW_CLOSED
+        )
+        (asserts! (< amendment-count (var-get max-amendments-per-proposal))
+            ERR_AMENDMENT_LIMIT_REACHED
+        )
+        (asserts! (> new-amount u0) ERR_INVALID_AMOUNT)
+        (asserts! (<= new-amount (var-get total-treasury)) ERR_INSUFFICIENT_FUNDS)
+        (map-set proposal-amendments {
+            proposal-id: proposal-id,
+            amendment-id: (+ amendment-count u1),
+        } {
+            amended-description: new-description,
+            amended-amount: new-amount,
+            amended-at: stacks-block-height,
+            amended-by: caller,
+            reason: reason,
+        })
+        (map-set amendment-counters proposal-id {
+            total-amendments: (+ amendment-count u1),
+            last-amendment-block: stacks-block-height,
+        })
+        (map-set proposals proposal-id
+            (merge proposal {
+                description: new-description,
+                amount: new-amount,
+            })
+        )
+        (ok (+ amendment-count u1))
+    )
+)
+
+(define-public (revoke-vote-after-amendment (proposal-id uint))
+    (let (
+            (caller tx-sender)
+            (vote-data (unwrap! (get-vote proposal-id caller) ERR_PROPOSAL_NOT_FOUND))
+            (proposal (unwrap! (get-proposal proposal-id) ERR_PROPOSAL_NOT_FOUND))
+            (amendment-data (map-get? amendment-counters proposal-id))
+            (voting-weight (get weight vote-data))
+        )
+        (asserts! (is-some amendment-data) ERR_PROPOSAL_NOT_FOUND)
+        (asserts! (<= stacks-block-height (get end-block proposal))
+            ERR_VOTING_ENDED
+        )
+        (map-delete votes {
+            proposal-id: proposal-id,
+            voter: caller,
+        })
+        (map-set proposals proposal-id
+            (merge proposal {
+                votes-for: (if (get vote vote-data)
+                    (if (>= (get votes-for proposal) voting-weight)
+                        (- (get votes-for proposal) voting-weight)
+                        u0
+                    )
+                    (get votes-for proposal)
+                ),
+                votes-against: (if (get vote vote-data)
+                    (get votes-against proposal)
+                    (if (>= (get votes-against proposal) voting-weight)
+                        (- (get votes-against proposal) voting-weight)
+                        u0
+                    )
+                ),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (configure-amendment-parameters
+        (max-amendments uint)
+        (window-percentage uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+        (asserts! (and (>= max-amendments u1) (<= max-amendments u10))
+            ERR_INVALID_AMOUNT
+        )
+        (asserts! (and (>= window-percentage u10) (<= window-percentage u100))
+            ERR_INVALID_AMOUNT
+        )
+        (var-set max-amendments-per-proposal max-amendments)
+        (var-set amendment-window-percentage window-percentage)
+        (ok true)
+    )
+)
+
+(define-read-only (get-proposal-amendment
+        (proposal-id uint)
+        (amendment-id uint)
+    )
+    (map-get? proposal-amendments {
+        proposal-id: proposal-id,
+        amendment-id: amendment-id,
+    })
+)
+
+(define-read-only (get-amendment-count (proposal-id uint))
+    (map-get? amendment-counters proposal-id)
+)
+
+(define-read-only (get-amendment-parameters)
+    {
+        max-amendments: (var-get max-amendments-per-proposal),
+        window-percentage: (var-get amendment-window-percentage),
+    }
+)
+
+(define-read-only (can-amend-proposal (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal (let (
+                (amendment-data (default-to {
+                    total-amendments: u0,
+                    last-amendment-block: u0,
+                }
+                    (map-get? amendment-counters proposal-id)
+                ))
+                (amendment-count (get total-amendments amendment-data))
+                (voting-period (- (get end-block proposal) (get start-block proposal)))
+                (amendment-window (/ (* voting-period (var-get amendment-window-percentage)) u100))
+                (amendment-deadline (+ (get start-block proposal) amendment-window))
+            )
+            (and
+                (<= stacks-block-height amendment-deadline)
+                (< amendment-count (var-get max-amendments-per-proposal))
+                (not (get executed proposal))
+            )
+        )
+        false
+    )
+)
+
+(define-read-only (get-amendment-deadline (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal (let (
+                (voting-period (- (get end-block proposal) (get start-block proposal)))
+                (amendment-window (/ (* voting-period (var-get amendment-window-percentage)) u100))
+            )
+            (some (+ (get start-block proposal) amendment-window))
+        )
+        none
+    )
+)
+
+(define-read-only (has-proposal-been-amended (proposal-id uint))
+    (match (map-get? amendment-counters proposal-id)
+        data (> (get total-amendments data) u0)
+        false
+    )
+)
+
+(define-read-only (get-all-proposal-amendments (proposal-id uint))
+    (let ((amendment-data (map-get? amendment-counters proposal-id)))
+        (match amendment-data
+            data (get total-amendments data)
+            u0
+        )
+    )
+)
