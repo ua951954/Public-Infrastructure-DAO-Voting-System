@@ -1196,3 +1196,40 @@
         )
     )
 )
+
+(define-read-only (get-governance-overview)
+    {
+        treasury: (var-get total-treasury),
+        total-citizens: (var-get total-registered-citizens),
+        proposal-count: (var-get proposal-counter),
+        timelock-delay: (var-get timelock-delay),
+        base-quorum: (var-get base-quorum-percentage),
+        max-quorum: (var-get max-quorum-percentage),
+        min-quorum: (var-get min-quorum-percentage),
+        amendment-max: (var-get max-amendments-per-proposal),
+        amendment-window: (var-get amendment-window-percentage),
+    }
+)
+
+(define-read-only (get-proposal-state (proposal-id uint))
+    (match (get-proposal proposal-id)
+        proposal
+        {
+            exists: true,
+            active: (and
+                (<= stacks-block-height (get end-block proposal))
+                (not (get executed proposal))
+            ),
+            executable: (is-proposal-executable proposal-id),
+            scheduled: (is-proposal-scheduled proposal-id),
+            quorum-met: (is-quorum-met proposal-id),
+        }
+        {
+            exists: false,
+            active: false,
+            executable: false,
+            scheduled: false,
+            quorum-met: false,
+        }
+    )
+)
